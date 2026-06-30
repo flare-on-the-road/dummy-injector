@@ -279,6 +279,12 @@ def main():
             logger.error("❌ Vision API 실패 → 파이프라인 중단")
             sys.exit(1)
 
+        # worker와 동일: vlm 결과가 비면(carlight 단독/저신뢰도/무시 케이스) 저장 생략
+        # → detection/ 업로드와 백엔드 저장 모두 건너뜀
+        if not (vision_result.get("vlm") or []):
+            logger.info("⏭ 위험 탐지 없음 (carlight 단독/저신뢰도) → 저장 생략 (worker와 동일)")
+            sys.exit(0)
+
         if not args.skip_r2:
             annotated_b64 = vision_result.get("annotated_image_b64")
             detection_img = base64.b64decode(annotated_b64) if annotated_b64 else image_bytes
