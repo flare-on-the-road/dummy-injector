@@ -15,6 +15,7 @@ injector/main.py — 로컬 이미지를 파이프라인에 수동 주입하는 
 
 import argparse
 import base64
+import json
 import logging
 import os
 import sys
@@ -90,8 +91,26 @@ def upload_to_r2(s3, image_bytes: bytes, key: str) -> bool:
 
 # ── Vision API ────────────────────────────────────────────────────────────────
 
-def call_vlm_only(image_bytes: bytes) -> Optional[dict]:
-    """bbox 이미지를 vision-model /vlm 엔드포인트에 직접 전달해 VLM 결과만 받는다."""
+def _parse_detections(spec: str) -> list:
+    """'fire:0.65,carlight:0.55' → [{'class_name':'fire','confidence':0.65}, ...]
+
+    신뢰도를 생략하면(예: 'fire') 0.5로 채운다. vlm 모드에서 VLM에 무엇을 판정시킬지 지정한다.
+    """
+    items = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            name, conf = token.split(":", 1)
+            items.append({"class_name": name.strip(), "confidence": float(conf)})
+        else:
+            items.append({"class_name": token, "confidence": 0.5})
+    return items
+
+
+def call_vlm_only(image_bytes: bytes, detections: list) -> Optional[dict]:
+    """bbox 이미지 + 탐지목록을 vision-model /vlm 엔드포인트에 직접 전달해 VLM 결과만 받는다."""
     if not VISION_API_URL:
         logger.error("❌ VISION_API_URL 미설정")
         return None
@@ -100,11 +119,14 @@ def call_vlm_only(image_bytes: bytes) -> Optional[dict]:
         resp = requests.post(
             url,
             files={"image": ("frame.jpg", image_bytes, "image/jpeg")},
+            data={"detections": json.dumps(detections)},
             timeout=VISION_TIMEOUT,
         )
         resp.raise_for_status()
-        result = resp.json()
-        logger.info(f"✓ /vlm 응답: is_fire={result.get('is_fire')}  reason={result.get('reason')}")
+        result = resp.json()  # 신 형식: [{class_name, is_false_positive, reason}, ...]
+        items = result if isinstance(result, list) else []
+        confirmed = [v for v in items if not v.get("is_false_positive")]
+        logger.info(f"✓ /vlm 응답: {len(items)}건 판정, 화재확정 {len(confirmed)}건")
         return result
     except requests.exceptions.ConnectionError:
         logger.error(f"❌ Vision API 연결 실패: {url}")
@@ -138,7 +160,8 @@ def call_predict(image_bytes: bytes, display_name: str) -> Optional[dict]:
         )
         vlm = result.get("vlm")
         if vlm:
-            logger.info(f"  VLM: is_fire={vlm.get('is_fire')}  reason={vlm.get('reason')}")
+            confirmed = [v for v in vlm if not v.get("is_false_positive")]
+            logger.info(f"  VLM: {len(vlm)}건 판정, 화재확정 {len(confirmed)}건")
         return result
     except requests.exceptions.ConnectionError:
         logger.error(f"❌ Vision API 연결 실패: {url}")
@@ -158,7 +181,7 @@ def post_event(location: dict, vision_result: dict, snapshot_key: str) -> Option
         logger.error("❌ BACKEND_API_URL 미설정")
         return None
     url = f"{BACKEND_API_URL.rstrip('/')}/api/events"
-    vlm = vision_result.get("vlm") or {}
+    vlm_results = vision_result.get("vlm") or []
     detections = [
         {
             "label": d["class_name"],
@@ -172,10 +195,9 @@ def post_event(location: dict, vision_result: dict, snapshot_key: str) -> Option
         "cctv_name": location["display_name"],
         "location_name": location["location_name"],
         "detected_at": datetime.now(timezone.utc).astimezone(KST).isoformat(),
-        "is_fire": vlm.get("is_fire"),
+        "vlm_results": vlm_results,
         "detections": detections,
         "snapshot_key": snapshot_key,
-        "vlm_reason": vlm.get("reason"),
     }
     try:
         resp = requests.post(url, json=payload, timeout=BACKEND_TIMEOUT)
@@ -214,6 +236,14 @@ def main():
         help=(
             "full(기본): 원본→ONNX→bbox→VLM→detection/→백엔드 전체 파이프라인 | "
             "vlm: bbox 이미지→VLM만→detection/→백엔드 (VLM 단독 검증)"
+        ),
+    )
+    parser.add_argument(
+        "--detections",
+        default="fire:0.6",
+        help=(
+            "vlm 모드에서 VLM에 판정시킬 탐지목록. "
+            "형식: 'fire:0.65,carlight:0.55' (신뢰도 생략 시 0.5). full 모드에선 무시됨"
         ),
     )
     args = parser.parse_args()
@@ -263,7 +293,13 @@ def main():
         # bbox 이미지 → VLM만 → detection/ → 백엔드 (ONNX 생략)
         logger.info("[ 모드: VLM 단독 파이프라인 ]")
 
-        vlm_result = call_vlm_only(image_bytes)
+        det_list = _parse_detections(args.detections)
+        if not det_list:
+            logger.error("❌ --detections 가 비어있습니다. 예: --detections 'fire:0.65'")
+            sys.exit(1)
+        logger.info(f"  VLM 입력 탐지목록: {det_list}")
+
+        vlm_result = call_vlm_only(image_bytes, det_list)
         if vlm_result is None:
             logger.error("❌ VLM 호출 실패 → 파이프라인 중단")
             sys.exit(1)
